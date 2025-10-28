@@ -8,6 +8,9 @@ from supabase import create_client, Client
 import os
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from sklearn.preprocessing import LabelEncoder
+from lime.lime_tabular import LimeTabularExplainer
+import shap
 
 # Load environment variables
 load_dotenv()
@@ -33,6 +36,16 @@ supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_SERVICE_KEY")
 )
+
+# ============================================================================
+# GLOBAL EXPLAINER VARIABLES
+# ============================================================================
+
+explainer_lime = None
+explainer_shap = None
+explainer_X = None
+explainer_feature_names = None
+explainer_merged_df = None
 
 # ============================================================================
 # PYDANTIC MODELS (Request/Response schemas)
@@ -95,6 +108,113 @@ def assign_risk_tier(risk_score: float) -> str:
     else:
         return "Low"
 
+def initialize_explainers():
+    """Initialize LIME and SHAP explainers on startup"""
+    global explainer_lime, explainer_shap, explainer_X, explainer_feature_names, explainer_merged_df
+    
+    try:
+        print("🔄 Initializing LIME and SHAP explainers...")
+        
+        # Load data
+        features_df = pd.read_csv("features_v4.csv")
+        predictions_df = pd.read_csv("predictions_for_person_b.csv")
+        
+        print(f"📊 Predictions columns: {predictions_df.columns.tolist()}")
+        
+        # Select prediction columns (use actual CSV column names)
+        pred_cols = ['node_id']
+        
+        # Map CSV columns to standard names
+        rename_map = {}
+        
+        if 'graphsage_pred' in predictions_df.columns:
+            pred_cols.append('graphsage_pred')
+            rename_map['graphsage_pred'] = 'graphsage_prediction'
+        
+        if 'lstm_pred' in predictions_df.columns:
+            pred_cols.append('lstm_pred')
+            rename_map['lstm_pred'] = 'lstm_prediction'
+        
+        if 'xgboost_pred' in predictions_df.columns:
+            pred_cols.append('xgboost_pred')
+            rename_map['xgboost_pred'] = 'xgboost_prediction'
+        
+        if 'ensemble_pred' in predictions_df.columns:
+            pred_cols.append('ensemble_pred')
+            rename_map['ensemble_pred'] = 'ensemble_weighted_prediction'
+        
+        # Select and rename columns
+        pred_subset = predictions_df[pred_cols].copy()
+        pred_subset = pred_subset.rename(columns=rename_map)
+        
+        # Merge datasets
+        explainer_merged_df = features_df.merge(
+            pred_subset,
+            on='node_id',
+            how='inner'
+        )
+        
+        print(f"✓ Merged {len(explainer_merged_df)} rows")
+        
+        # Prepare features
+        exclude_cols = [
+            'node_id', 'name', 'latitude', 'longitude', 'type', 'usage', 'urban',
+            'graphsage_prediction', 'lstm_prediction', 'xgboost_prediction', 
+            'ensemble_weighted_prediction', 'risk_score', 'ensemble_prediction',
+            'lat', 'lon', 'Latitude', 'Longitude'  # Additional variations
+        ]
+        
+        feature_cols = [c for c in explainer_merged_df.columns if c not in exclude_cols]
+        X_df = explainer_merged_df[feature_cols].copy()
+        
+        # Encode categorical columns
+        for col in X_df.select_dtypes(include=['object']).columns:
+            le = LabelEncoder()
+            X_df[col] = le.fit_transform(X_df[col].astype(str))
+        
+        explainer_X = X_df.values
+        explainer_feature_names = X_df.columns.tolist()
+        
+        # Initialize LIME
+        explainer_lime = LimeTabularExplainer(
+            explainer_X,
+            feature_names=explainer_feature_names,
+            class_names=['No Failure', 'Failure'],
+            discretize_continuous=True,
+            mode='classification'
+        )
+        print("✓ LIME explainer initialized")
+        
+        # Initialize SHAP
+        background_data = shap.sample(explainer_X, 20)
+        
+        def ensemble_predict(X_batch):
+            w_graphsage = 0.333
+            w_lstm = 0.331
+            w_xgboost = 0.336
+            
+            predictions = []
+            for row in X_batch:
+                distances = np.sum(np.abs(explainer_X - row), axis=1)
+                idx = np.argmin(distances)
+                
+                ensemble_prob = (
+                    w_graphsage * explainer_merged_df.iloc[idx]['graphsage_prediction'] +
+                    w_lstm * explainer_merged_df.iloc[idx]['lstm_prediction'] +
+                    w_xgboost * explainer_merged_df.iloc[idx]['xgboost_prediction']
+                )
+                predictions.append(ensemble_prob)
+            
+            return np.array(predictions)
+        
+        explainer_shap = shap.KernelExplainer(ensemble_predict, background_data)
+        print("✓ SHAP explainer initialized")
+        print("✅ All explainers ready!")
+        
+    except Exception as e:
+        print(f"⚠️ Warning: Could not initialize explainers: {str(e)}")
+        print("Explainability endpoints will not be available")
+
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
@@ -117,7 +237,8 @@ async def health_check():
         return {
             "status": "healthy",
             "database": "connected",
-            "nodes_count": response.count
+            "nodes_count": response.count,
+            "explainers_initialized": explainer_lime is not None and explainer_shap is not None
         }
     except Exception as e:
         return {
@@ -240,6 +361,89 @@ async def get_node_details(node_id: int):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching node details: {str(e)}")
+
+@app.get("/api/explain/{node_id}")
+async def explain_node(node_id: int):
+    """
+    Get LIME and SHAP explanations for a specific node.
+    
+    This endpoint provides explainability for the risk prediction:
+    - **LIME**: Local interpretable model-agnostic explanations
+    - **SHAP**: SHapley Additive exPlanations
+    
+    Returns the top 10 features influencing the failure prediction for the specified node.
+    """
+    try:
+        if explainer_lime is None or explainer_shap is None:
+            raise HTTPException(status_code=503, detail="Explainers not initialized")
+        
+        # Find node in data
+        node_data = explainer_merged_df[explainer_merged_df['node_id'] == node_id]
+        if node_data.empty:
+            raise HTTPException(status_code=404, detail=f"Node {node_id} not found")
+        
+        node_row = node_data.iloc[0]
+        row_idx = node_data.index[0]
+        array_idx = explainer_merged_df.index.get_loc(row_idx)
+        
+        # Define prediction function for LIME
+        def ensemble_predict_proba(X_batch):
+            w_graphsage = 0.333
+            w_lstm = 0.331
+            w_xgboost = 0.336
+            predictions = []
+            for row in X_batch:
+                distances = np.sum(np.abs(explainer_X - row), axis=1)
+                idx = np.argmin(distances)
+                ensemble_prob = (
+                    w_graphsage * explainer_merged_df.iloc[idx]['graphsage_prediction'] +
+                    w_lstm * explainer_merged_df.iloc[idx]['lstm_prediction'] +
+                    w_xgboost * explainer_merged_df.iloc[idx]['xgboost_prediction']
+                )
+                predictions.append([1 - ensemble_prob, ensemble_prob])
+            return np.array(predictions)
+        
+        # Generate LIME explanation
+        lime_exp = explainer_lime.explain_instance(
+            explainer_X[array_idx],
+            ensemble_predict_proba,
+            num_features=10
+        )
+        lime_features = [
+            {'feature': f, 'weight': float(w)} 
+            for f, w in lime_exp.as_list()
+        ]
+        
+        # Generate SHAP explanation
+        shap_values = explainer_shap.shap_values(explainer_X[array_idx:array_idx+1])[0]
+        feature_importance = list(zip(explainer_feature_names, shap_values))
+        feature_importance.sort(key=lambda x: abs(x[1]), reverse=True)
+        shap_features = [
+            {'feature': f, 'value': float(v)} 
+            for f, v in feature_importance[:10]
+        ]
+        
+        # Build response
+        response = {
+            'node_id': int(node_id),
+            'name': str(node_row['name']),
+            'ensemble_prediction': float(node_row['ensemble_weighted_prediction']),
+            'risk_tier': assign_risk_tier(float(node_row['ensemble_weighted_prediction'])),
+            'lime': {
+                'features': lime_features
+            },
+            'shap': {
+                'features': shap_features,
+                'base_value': float(explainer_shap.expected_value)
+            }
+        }
+        
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating explanation: {str(e)}")
 
 @app.get("/api/maintenance", response_model=List[MaintenanceTask])
 async def get_maintenance_schedule(
@@ -497,6 +701,19 @@ async def populate_database():
         error_details = traceback.format_exc()
         print(f"ERROR: {error_details}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+# ============================================================================
+# STARTUP EVENT
+# ============================================================================
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize explainers when app starts"""
+    initialize_explainers()
+
+# ============================================================================
+# MAIN
+# ============================================================================
     
 if __name__ == "__main__":
     import uvicorn
